@@ -1,14 +1,15 @@
-"""SQLite database setup and durable Agent Relay models.
+"""PostgreSQL database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module provides database connection management, models, and transaction
+helpers. The application defaults to PostgreSQL (with backward compatibility
+for SQLite test environments) and uses row-level locking for claims and state
+transitions.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
@@ -19,7 +20,16 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    raw = (
+        os.getenv("RELAY_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or "postgresql+psycopg://relay:relaypassword@postgres:5432/relay"
+    )
+    if raw.startswith("postgresql://"):
+        return "postgresql+psycopg://" + raw[len("postgresql://") :]
+    if raw.startswith("postgres://"):
+        return "postgresql+psycopg://" + raw[len("postgres://") :]
+    return raw
 
 
 def positive_int(name: str, default: int) -> int:
@@ -141,6 +151,8 @@ if _is_sqlite(DATABASE_URL):
         from sqlalchemy.pool import StaticPool
 
         engine_kwargs["poolclass"] = StaticPool
+else:
+    engine_kwargs.update({"pool_size": 10, "max_overflow": 20})
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
@@ -158,8 +170,15 @@ if _is_sqlite(DATABASE_URL):
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
 
-def init_db() -> None:
-    Base.metadata.create_all(engine)
+def init_db(retries: int = 1, delay: float = 1.0) -> None:
+    for attempt in range(retries):
+        try:
+            Base.metadata.create_all(engine)
+            return
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
 
 
 @contextmanager
@@ -177,19 +196,21 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run an isolated transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    On SQLite, ``BEGIN IMMEDIATE`` acquires a reserved lock so concurrent
+    processes do not race or conflict. On PostgreSQL, standard transactions
+    combined with row locking (such as ``FOR UPDATE SKIP LOCKED``) ensure safe
+    concurrency.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.begin()
         yield session
         session.flush()
         connection.commit()
@@ -210,11 +231,12 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
             select(Attempt)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
+            .with_for_update(skip_locked=True)
         )
     )
     count = 0
     for attempt in expired:
-        task = db.get(Task, attempt.task_id)
+        task = db.get(Task, attempt.task_id, with_for_update=True)
         if task is None or attempt.outcome != "processing":
             continue
         attempt.outcome = "expired"
