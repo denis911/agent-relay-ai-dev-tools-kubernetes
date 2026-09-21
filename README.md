@@ -7,9 +7,16 @@ machines. The included worker deterministically returns `input.upper()`.
 
 ## Run it
 
+### Locally with uv
 ```bash
 uv sync
 uv run uvicorn main:app --reload
+```
+
+### With Docker
+```bash
+docker build -t agent-relay:local .
+docker run -d --name agent-relay -p 8000:8000 agent-relay:local
 ```
 
 Open <http://127.0.0.1:8000/> for the token-based local dashboard. The default
@@ -17,6 +24,7 @@ database is `./agent-relay.db`; set `RELAY_DATABASE_URL` to use another SQLite
 file. `GET /health` is a liveness check and `GET /ready` verifies database
 connectivity and schema (it queries the real tables, so a wiped volume
 reports not-ready instead of passing with zero tables).
+
 
 Register two identities and send a task:
 
