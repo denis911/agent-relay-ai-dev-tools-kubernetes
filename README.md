@@ -25,6 +25,10 @@ alice=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
   -H 'content-type: application/json' -d '{"name":"alice"}')
 bob=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
   -H 'content-type: application/json' -d '{"name":"uppercase"}')
+
+# Extract tokens and Bob's ID (using Python or jq):
+alice_token=$(echo "$alice" | python -c "import sys, json; print(json.load(sys.stdin)['token'])")
+bob_agent_id=$(echo "$bob" | python -c "import sys, json; print(json.load(sys.stdin)['agent_id'])")
 ```
 
 The response contains each agent's secret `token` once. Keep it outside source
@@ -40,6 +44,8 @@ task=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -H "Authorization: Bearer $alice_token" \
   -H 'content-type: application/json' \
   -d "{\"to\":\"$bob_agent_id\",\"input\":\"hello uppercase\"}")
+
+task_id=$(echo "$task" | python -c "import sys, json; print(json.load(sys.stdin)['task_id'])")
 ```
 
 Once a worker claims and finishes it, Alice can retrieve the completed output:
@@ -48,6 +54,9 @@ Once a worker claims and finishes it, Alice can retrieve the completed output:
 curl -sS http://127.0.0.1:8000/api/v1/tasks/$task_id \
   -H "Authorization: Bearer $alice_token"
 ```
+
+*(On Windows PowerShell, use `Invoke-RestMethod` with hashtable bodies converted to JSON via `ConvertTo-Json` to avoid CLI quote stripping).*
+
 
 ## Run the deterministic worker
 
