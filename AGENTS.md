@@ -7,3 +7,7 @@
   - Start server: `uv run uvicorn main:app --reload`
   - Run worker: `uv run python main.py worker ...`
   - Run tests: `uv run pytest -q`
+
+## Version Control & Syncing
+- **Commit and push frequently**: Always run tests with `uv run pytest -q`. Once tests pass, commit and push changes to GitHub promptly to keep the remote branch in sync.
+

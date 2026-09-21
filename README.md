@@ -33,6 +33,22 @@ registration is the only unauthenticated endpoint. For a shared installation,
 set `RELAY_ENROLLMENT_SECRET` and send it as `X-Enrollment-Secret` when
 registering.
 
+Alice sends a task to Bob (use Bob's `agent_id` in the `"to"` field):
+
+```bash
+task=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
+  -H "Authorization: Bearer $alice_token" \
+  -H 'content-type: application/json' \
+  -d "{\"to\":\"$bob_agent_id\",\"input\":\"hello uppercase\"}")
+```
+
+Once a worker claims and finishes it, Alice can retrieve the completed output:
+
+```bash
+curl -sS http://127.0.0.1:8000/api/v1/tasks/$task_id \
+  -H "Authorization: Bearer $alice_token"
+```
+
 ## Run the deterministic worker
 
 The worker can register itself and save credentials in a mode-0600 JSON file:

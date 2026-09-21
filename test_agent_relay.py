@@ -160,3 +160,69 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
         assert missing_name.json()["error"]["code"] == "invalid_input"
+
+
+def test_alice_and_bob_task_exchange_via_api():
+    """End-to-end integration test: Alice creates a task for Bob,
+
+    Bob claims it, processes it, submits the result, and Alice retrieves the completed output.
+    """
+    with TestClient(main.app) as client:
+        # 1. Register Alice and Bob
+        alice, alice_headers = register(client, "alice")
+        bob, bob_headers = register(client, "bob")
+
+        # 2. Alice sends a task to Bob ("to" points to Bob's agent_id)
+        send_response = client.post(
+            "/api/v1/tasks",
+            headers={**alice_headers, "Idempotency-Key": "alice-to-bob-001"},
+            json={"to": bob["agent_id"], "input": "hello bob from alice"},
+        )
+        assert send_response.status_code == 201
+        task_data = send_response.json()
+        assert task_data["status"] == "queued"
+        task_id = task_data["task_id"]
+
+        # 3. Bob claims the pending task
+        claim_response = client.post(
+            "/api/v1/tasks/claim",
+            headers=bob_headers,
+            json={"worker_id": "bob-worker-1", "wait_seconds": 0},
+        )
+        assert claim_response.status_code == 200
+        claim = claim_response.json()
+        assert claim["task_id"] == task_id
+        assert claim["from"] == alice["agent_id"]
+        assert claim["input"] == "hello bob from alice"
+        claim_token = claim["claim_token"]
+
+        # 4. Bob processes work (deterministic uppercase) and reports completion
+        output = claim["input"].upper()
+        complete_response = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=bob_headers,
+            json={"claim_token": claim_token, "output": output},
+        )
+        assert complete_response.status_code == 200
+        assert complete_response.json()["status"] == "completed"
+
+        # 5. Alice inspects the task and verifies the output
+        get_response = client.get(f"/api/v1/tasks/{task_id}", headers=alice_headers)
+        assert get_response.status_code == 200
+        task_result = get_response.json()
+        assert task_result["task_id"] == task_id
+        assert task_result["status"] == "completed"
+        assert task_result["from"] == alice["agent_id"]
+        assert task_result["to"] == bob["agent_id"]
+        assert task_result["output"] == "HELLO BOB FROM ALICE"
+        assert task_result["error"] is None
+        assert task_result["attempt_count"] == 1
+
+        # 6. Verify attempts record
+        attempts_response = client.get(f"/api/v1/tasks/{task_id}/attempts", headers=alice_headers)
+        assert attempts_response.status_code == 200
+        attempts = attempts_response.json()["items"]
+        assert len(attempts) == 1
+        assert attempts[0]["outcome"] == "completed"
+        assert attempts[0]["worker_id"] == "bob-worker-1"
+
