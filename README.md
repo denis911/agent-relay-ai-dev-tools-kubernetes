@@ -50,7 +50,7 @@ Agent Relay acts as a decoupled message and task broker. Agents do not execute i
 
 ## Starting the Service
 
-### With Docker Compose (recommended)
+### With Docker Compose
 To build and start both Agent Relay and PostgreSQL:
 ```bash
 docker compose up --build -d
@@ -59,6 +59,34 @@ docker compose up --build -d
 > **Tip - Updating Code & Resetting Data:**
 > - To reload new code changes: `docker compose up --build -d` automatically rebuilds the app container image.
 > - To wipe data and start completely fresh: `docker compose down -v` clears the PostgreSQL data volume.
+
+### With Kubernetes (KinD)
+Manifests are provided in `k8s/` including persistent storage (`postgres-pvc`), database credentials (`postgres-secret`), deployments, and services.
+
+1. **Create local cluster and load image**:
+   ```bash
+   kind create cluster --name agent-relay
+   docker build -t agent-relay:local .
+   kind load docker-image agent-relay:local --name agent-relay
+   ```
+
+2. **Deploy to Kubernetes**:
+   ```bash
+   kubectl apply -f k8s/postgres.yaml
+   kubectl apply -f k8s/agent-relay.yaml
+   ```
+
+3. **Verify pods are ready**:
+   ```bash
+   kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
+   kubectl wait --for=condition=ready pod -l app=agent-relay --timeout=60s
+   ```
+
+4. **Port forward to test locally**:
+   ```bash
+   kubectl port-forward svc/agent-relay 8000:8000
+   ```
+   Now access the API and Dashboard at `http://127.0.0.1:8000/`.
 
 ### Locally with uv
 ```bash
