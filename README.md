@@ -27,7 +27,9 @@ connectivity and schema (it queries the real tables, so a wiped volume
 reports not-ready instead of passing with zero tables).
 
 
-Register two identities and send a task:
+### 1. Register two identities
+
+Registration creates an agent identity and inbox. It returns a secret Bearer `token` **once** (keep it secure):
 
 ```bash
 alice=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
@@ -35,16 +37,15 @@ alice=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
 bob=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
   -H 'content-type: application/json' -d '{"name":"uppercase"}')
 
-# Extract tokens and Bob's ID (using Python or jq):
+# Extract tokens and agent IDs:
 alice_token=$(echo "$alice" | python -c "import sys, json; print(json.load(sys.stdin)['token'])")
+bob_token=$(echo "$bob" | python -c "import sys, json; print(json.load(sys.stdin)['token'])")
 bob_agent_id=$(echo "$bob" | python -c "import sys, json; print(json.load(sys.stdin)['agent_id'])")
 ```
 
-The response contains each agent's secret `token` once. Keep it outside source
-control. Use `Authorization: Bearer <token>` for all subsequent API calls;
-registration is the only unauthenticated endpoint. For a shared installation,
-set `RELAY_ENROLLMENT_SECRET` and send it as `X-Enrollment-Secret` when
-registering.
+Use `Authorization: Bearer <token>` for all subsequent API calls; registration is the only unauthenticated endpoint. For a shared installation, set `RELAY_ENROLLMENT_SECRET` and send it as `X-Enrollment-Secret` when registering.
+
+### 2. Send a task
 
 Alice sends a task to Bob (use Bob's `agent_id` in the `"to"` field):
 
@@ -57,19 +58,55 @@ task=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
 task_id=$(echo "$task" | python -c "import sys, json; print(json.load(sys.stdin)['task_id'])")
 ```
 
-Once a worker claims and finishes it, Alice can retrieve the completed output:
+If you check the task now:
+```bash
+curl -sS http://127.0.0.1:8000/api/v1/tasks/$task_id \
+  -H "Authorization: Bearer $alice_token"
+```
+It will show `"status": "queued"`. **This is by design**: the relay is an asynchronous queue service. Registering an agent creates an inbox, but does not execute work; tasks wait in the queue until a worker process serving that agent claims them.
+
+### 3. Run Bob's worker to process tasks
+
+In another terminal (or background process), start the deterministic worker using Bob's credentials:
+
+```bash
+uv run python main.py worker \
+  --base-url http://127.0.0.1:8000 \
+  --agent-id "$bob_agent_id" \
+  --token "$bob_token" \
+  --worker-id bob-worker-1
+```
+
+The worker long-polls `POST /api/v1/tasks/claim`, leases the queued task, computes `input.upper()`, and reports completion back to the relay.
+
+### 4. Retrieve the completed result
+
+Once the worker completes the task, Alice can query the task again:
 
 ```bash
 curl -sS http://127.0.0.1:8000/api/v1/tasks/$task_id \
   -H "Authorization: Bearer $alice_token"
 ```
+Output:
+```json
+{
+  "task_id": "...",
+  "from": "agent_...",
+  "to": "agent_...",
+  "input": "hello uppercase",
+  "status": "completed",
+  "output": "HELLO UPPERCASE",
+  "error": null,
+  "attempt_count": 1
+}
+```
 
-*(On Windows PowerShell, use `Invoke-RestMethod` with hashtable bodies converted to JSON via `ConvertTo-Json` to avoid CLI quote stripping).*
+*(On Windows PowerShell, use `Invoke-RestMethod` with hashtable bodies converted via `ConvertTo-Json` to avoid CLI quote stripping).*
 
+## Worker options & failure handling
 
-## Run the deterministic worker
-
-The worker can register itself and save credentials in a mode-0600 JSON file:
+### Automatic self-registration with credentials file
+Instead of passing tokens manually on the CLI, the worker can self-register on its first run and save credentials in a local mode-0600 JSON file:
 
 ```bash
 uv run python main.py worker \
@@ -79,25 +116,17 @@ uv run python main.py worker \
   --worker-id laptop-1
 ```
 
-For failure/redelivery demonstrations, make local execution intentionally slow
-and stop the process after one completion:
+### Simulating slow work and lease timeouts
+To demonstrate heartbeating, redelivery, or worker crashes:
 
 ```bash
-uv run python main.py worker --credentials ./uppercase-credentials.json \
-  --slow-seconds 75 --worker-id slow-laptop
+uv run python main.py worker \
+  --credentials ./uppercase-credentials.json \
+  --slow-seconds 75 \
+  --worker-id slow-laptop
 ```
 
-The worker heartbeats during long work. Killing it leaves the claim leased;
-after the 60-second lease expires, another worker can claim the task with a new
-token and incremented attempt number. `RELAY_LEASE_SECONDS` and
-`RELAY_MAX_ATTEMPTS` are configurable server settings.
-
-An existing credential can also be supplied explicitly (the token is not
-written to disk):
-
-```bash
-uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id laptop-2
-```
+The worker sends periodic heartbeats to extend its lease during long operations. If the worker process is killed before finishing, its claim expires after the 60-second lease, allowing another worker process to claim the task with an incremented attempt count. `RELAY_LEASE_SECONDS` and `RELAY_MAX_ATTEMPTS` are configurable via environment variables.
 
 ## Storage and delivery behavior
 
