@@ -118,10 +118,9 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Agent Relay", version="0.1.0", lifespan=lifespan)
 # ASGI transports used by small scripts do not always run lifespan handlers;
 # initialize the schema at import as well as during normal application startup.
-try:
-    init_db()
-except Exception:
-    LOGGER.warning("Initial database connection during import failed; will retry in lifespan.")
+if __name__ != "__main__":
+    with contextlib.suppress(Exception):
+        init_db()
 
 
 @app.exception_handler(RelayError)

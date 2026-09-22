@@ -151,14 +151,19 @@ def save_credentials(path: Path, credentials: dict[str, str]) -> None:
 
 async def worker_command(args: argparse.Namespace) -> None:
     credentials = load_credentials(args.credentials) if args.credentials else None
-    if args.token:
-        if not args.agent_id:
-            raise SystemExit("--agent-id is required when --token is supplied")
-        credentials = {"agent_id": args.agent_id, "token": args.token}
+    if args.token is not None:
+        token_str = str(args.token).strip()
+        if not token_str:
+            raise SystemExit("--token was provided but is empty. Check that your token variable is set (e.g. $bob_token).")
+        if not args.agent_id or not str(args.agent_id).strip():
+            raise SystemExit("--agent-id is required and cannot be empty when --token is supplied")
+        credentials = {"agent_id": str(args.agent_id).strip(), "token": token_str}
     async with httpx.AsyncClient(base_url=args.base_url.rstrip("/"), timeout=20) as client:
         if credentials is None:
             if not args.name:
-                raise SystemExit("--name is required when --credentials does not contain an agent")
+                raise SystemExit(
+                    "--name is required to self-register an agent, or supply --token and --agent-id (or a valid --credentials file)"
+                )
             headers = {"X-Enrollment-Secret": args.enrollment_secret} if args.enrollment_secret else {}
             response = await client.post(
                 "/api/v1/agents", json={"name": args.name, "description": args.description}, headers=headers
