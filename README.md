@@ -1,36 +1,83 @@
 # Agent Relay
 
-Agent Relay is a small FastAPI service for registering agents, delivering one
-task at a time, and recording results. PostgreSQL persists the queue and attempts,
-while workers execute tasks on their own machines. The included worker deterministically
-returns `input.upper()`.
+Agent Relay is a lightweight FastAPI service for registering agents, delivering one task at a time, and recording results. PostgreSQL persists the task queue, agent directory, and delivery attempts, while workers execute tasks on their own machines. The included worker deterministically returns `input.upper()`.
 
-## Run it
+---
+
+## Architecture & How Agents Interact
+
+Agent Relay acts as a decoupled message and task broker. Agents do not execute inside the relay; registration creates an agent identity and inbox.
+
+```text
+  +------------------+         +----------------------------+         +-------------------+
+  |  Alice (Sender)  |         |   Agent Relay (FastAPI)    |         | Bob's Worker (Rx) |
+  |                  |         |       + PostgreSQL         |         |                   |
+  +--------+---------+         +--------------+-------------+         +---------+---------+
+           |                                  |                                 |
+           |  1. Register Agent Identities    |                                 |
+           |---- POST /api/v1/agents -------->|                                 |
+           |<--- 201 Created (Token & ID) ----|                                 |
+           |                                  |<--- POST /api/v1/agents --------|
+           |                                  |---- 201 Created (Token & ID) -->|
+           |                                  |                                 |
+           |  2. Dispatch Task (Bearer Alice) |                                 |
+           |---- POST /api/v1/tasks --------->|                                 |
+           |<--- 201 Created ("status":queued)|                                 |
+           |                                  |                                 |
+           |                                  |  3. Claim Work (Bearer Bob)     |
+           |                                  |<--- POST /api/v1/tasks/claim ---|
+           |                                  |---- 200 OK (Task & Claim Token)->
+           |                                  |                                 |
+           |                                  |  [ Worker runs input.upper() ]  |
+           |                                  |                                 |
+           |                                  |  4. Submit Result               |
+           |                                  |<--- POST .../tasks/{id}/complete|
+           |                                  |---- 200 OK ("status":completed)->
+           |                                  |                                 |
+           |  5. Query Result (Bearer Alice)  |                                 |
+           |---- GET /api/v1/tasks/{id} ----->|                                 |
+           |<--- 200 OK (output: "HELLO") ----|                                 |
+           v                                  v                                 v
+```
+
+### Task Lifecycle States
+1. **`queued`**: The sender submitted the task. It sits safely in PostgreSQL awaiting a claim by a recipient worker.
+2. **`processing`**: A worker serving the recipient claimed the task and holds an active lease (default: 60s). Long tasks extend the lease with periodic heartbeats.
+3. **`completed`**: The worker submitted output with its claim token.
+4. **`failed`**: The worker explicitly failed the task, or lease retries were exhausted (`attempts_exhausted`).
+
+---
+
+## Starting the Service
 
 ### With Docker Compose (recommended)
-Run Agent Relay and PostgreSQL together:
+To build and start both Agent Relay and PostgreSQL:
 ```bash
-docker compose up -d
+docker compose up --build -d
 ```
+
+> **Tip - Updating Code & Resetting Data:**
+> - To reload new code changes: `docker compose up --build -d` automatically rebuilds the app container image.
+> - To wipe data and start completely fresh: `docker compose down -v` clears the PostgreSQL data volume.
 
 ### Locally with uv
 ```bash
 uv sync
-# Ensure a PostgreSQL instance is running or set RELAY_DATABASE_URL
+# Ensure PostgreSQL is running or set RELAY_DATABASE_URL
 uv run uvicorn main:app --reload
 ```
 
-Open <http://127.0.0.1:8000/> for the token-based local dashboard. The default
-database connection is configured for PostgreSQL (`postgresql+psycopg://relay:relaypassword@postgres:5432/relay` in compose, or set `RELAY_DATABASE_URL`).
-`GET /health` is a liveness check and `GET /ready` verifies database
-connectivity and schema (it queries the real tables, so a wiped volume
-reports not-ready instead of passing with zero tables).
+- **Liveness check**: `GET http://127.0.0.1:8000/health`
+- **Readiness check**: `GET http://127.0.0.1:8000/ready` (queries real DB tables)
+- **Web Dashboard**: <http://127.0.0.1:8000/>
 
+---
 
-### 1. Register two identities
+## Step-by-Step Manual Testing
 
-Registration creates an agent identity and inbox. It returns a secret Bearer `token` **once** (keep it secure):
+### Option A: Bash / macOS / Linux / Git Bash
 
+#### 1. Register Alice and Bob
 ```bash
 alice=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
   -H 'content-type: application/json' -d '{"name":"alice"}')
@@ -41,14 +88,13 @@ bob=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
 alice_token=$(echo "$alice" | python -c "import sys, json; print(json.load(sys.stdin)['token'])")
 bob_token=$(echo "$bob" | python -c "import sys, json; print(json.load(sys.stdin)['token'])")
 bob_agent_id=$(echo "$bob" | python -c "import sys, json; print(json.load(sys.stdin)['agent_id'])")
+
+echo "Alice token: $alice_token"
+echo "Bob token:   $bob_token"
+echo "Bob ID:      $bob_agent_id"
 ```
 
-Use `Authorization: Bearer <token>` for all subsequent API calls; registration is the only unauthenticated endpoint. For a shared installation, set `RELAY_ENROLLMENT_SECRET` and send it as `X-Enrollment-Secret` when registering.
-
-### 2. Send a task
-
-Alice sends a task to Bob (use Bob's `agent_id` in the `"to"` field):
-
+#### 2. Alice sends a task to Bob
 ```bash
 task=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -H "Authorization: Bearer $alice_token" \
@@ -56,19 +102,18 @@ task=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/tasks \
   -d "{\"to\":\"$bob_agent_id\",\"input\":\"hello uppercase\"}")
 
 task_id=$(echo "$task" | python -c "import sys, json; print(json.load(sys.stdin)['task_id'])")
+echo "Task ID: $task_id"
 ```
 
-If you check the task now:
+If you query the task now:
 ```bash
 curl -sS http://127.0.0.1:8000/api/v1/tasks/$task_id \
   -H "Authorization: Bearer $alice_token"
 ```
-It will show `"status": "queued"`. **This is by design**: the relay is an asynchronous queue service. Registering an agent creates an inbox, but does not execute work; tasks wait in the queue until a worker process serving that agent claims them.
+It shows `"status": "queued"`.
 
-### 3. Run Bob's worker to process tasks
-
-In another terminal (or background process), start the deterministic worker using Bob's credentials:
-
+#### 3. Start Bob's worker to process the task
+In a separate terminal (or background job):
 ```bash
 uv run python main.py worker \
   --base-url http://127.0.0.1:8000 \
@@ -76,13 +121,9 @@ uv run python main.py worker \
   --token "$bob_token" \
   --worker-id bob-worker-1
 ```
+The worker claims the task, computes `input.upper()`, and marks it completed.
 
-The worker long-polls `POST /api/v1/tasks/claim`, leases the queued task, computes `input.upper()`, and reports completion back to the relay.
-
-### 4. Retrieve the completed result
-
-Once the worker completes the task, Alice can query the task again:
-
+#### 4. Check the completed result
 ```bash
 curl -sS http://127.0.0.1:8000/api/v1/tasks/$task_id \
   -H "Authorization: Bearer $alice_token"
@@ -101,56 +142,100 @@ Output:
 }
 ```
 
-*(On Windows PowerShell, use `Invoke-RestMethod` with hashtable bodies converted via `ConvertTo-Json` to avoid CLI quote stripping).*
+---
 
-## Worker options & failure handling
+### Option B: Windows PowerShell
 
-### Automatic self-registration with credentials file
-Instead of passing tokens manually on the CLI, the worker can self-register on its first run and save credentials in a local mode-0600 JSON file:
+#### 1. Register Alice and Bob
+```powershell
+$alice = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/agents" -Method Post -ContentType "application/json" -Body '{"name":"alice"}'
+$bob = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/agents" -Method Post -ContentType "application/json" -Body '{"name":"uppercase"}'
 
+$alice_token = $alice.token
+$bob_token = $bob.token
+$bob_agent_id = $bob.agent_id
+
+Write-Host "Alice token: $alice_token"
+Write-Host "Bob token:   $bob_token"
+Write-Host "Bob ID:      $bob_agent_id"
+```
+
+#### 2. Alice sends a task to Bob
+```powershell
+$headers = @{ "Authorization" = "Bearer $alice_token" }
+$body = @{ to = $bob_agent_id; input = "hello uppercase from powershell" } | ConvertTo-Json
+
+$task = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/tasks" -Method Post -Headers $headers -ContentType "application/json" -Body $body
+$task_id = $task.task_id
+Write-Host "Task ID: $task_id"
+```
+
+#### 3. Start Bob's worker
+```powershell
+uv run python main.py worker `
+  --base-url http://127.0.0.1:8000 `
+  --agent-id "$bob_agent_id" `
+  --token "$bob_token" `
+  --worker-id bob-worker-1
+```
+
+#### 4. Retrieve result
+```powershell
+$result = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/tasks/$task_id" -Headers $headers
+$result | Format-List *
+```
+
+---
+
+## Real-Time Inspection via Web Dashboard
+
+Open <http://127.0.0.1:8000/> in your browser:
+1. Paste either `$alice_token` or `$bob_token` into the Token prompt.
+2. The dashboard displays:
+   - Registered agent directory and last-seen timestamps.
+   - Live task status (`queued`, `processing`, `completed`, `failed`).
+   - Delivery attempts, worker IDs, and task inputs/outputs.
+
+---
+
+## Worker Options & Resilience Testing
+
+### Self-registration with credentials file
+Instead of passing tokens manually on the CLI, the worker can self-register once and persist credentials to disk:
 ```bash
 uv run python main.py worker \
   --base-url http://127.0.0.1:8000 \
   --name uppercase \
-  --credentials ./uppercase-credentials.json \
+  --credentials ./bob-credentials.json \
   --worker-id laptop-1
 ```
+On subsequent runs, only `--credentials ./bob-credentials.json` is needed.
 
-### Simulating slow work and lease timeouts
-To demonstrate heartbeating, redelivery, or worker crashes:
-
+### Simulating slow execution and lease timeouts
 ```bash
 uv run python main.py worker \
-  --credentials ./uppercase-credentials.json \
+  --credentials ./bob-credentials.json \
   --slow-seconds 75 \
   --worker-id slow-laptop
 ```
+- During slow work, the worker automatically sends periodic heartbeats to renew its 60-second lease.
+- If you terminate the worker process midway, the lease expires after 60 seconds; the relay automatically requeues the task for another worker to pick up with an incremented attempt count.
 
-The worker sends periodic heartbeats to extend its lease during long operations. If the worker process is killed before finishing, its claim expires after the 60-second lease, allowing another worker process to claim the task with an incremented attempt count. `RELAY_LEASE_SECONDS` and `RELAY_MAX_ATTEMPTS` are configurable via environment variables.
+---
 
-## Storage and delivery behavior
+## Storage & Delivery Guarantees
 
-`database.py` contains SQLAlchemy models, engine pooling, and transaction helpers.
-`storage.py` contains task/claim/recovery operations; routes and request models
-are kept in `main.py` and `schemas.py`. Claims and recovery leverage PostgreSQL's
-`FOR UPDATE SKIP LOCKED` for high-throughput, non-blocking concurrent claims across
-workers.
+- **PostgreSQL Concurrency**: Task claims leverage PostgreSQL's `FOR UPDATE SKIP LOCKED`. Multiple workers polling concurrently receive distinct tasks without blocking each other or causing deadlocks.
+- **At-least-once Delivery**: Tasks are leased to workers. If a worker fails or loses connectivity without heartbeating, the lease expires and the task is safely redelivered.
+- **Idempotent Retries**: Terminating requests (`complete` or `fail`) require the unique claim token issued during claim. Repeating the same result is idempotent; conflicting terminal results receive `409 Conflict`.
+- **Task Submission Idempotency**: Senders can supply an `Idempotency-Key` header on `POST /tasks` to ensure network retries do not duplicate tasks.
 
-Claims are at-least-once and leased for 60 seconds by default. Heartbeats extend
-an active lease. A completion or failure must include the recipient's bearer
-token and claim token. Repeating the exact terminal request with that claim
-token is idempotent; a stale token or different result receives `409`.
+---
 
-## Verify
+## Running Tests
 
-The test suite covers the main protocol, sender/recipient access boundaries,
-hashed claim-token behavior, idempotent terminal retries, concurrent claims,
-lease expiry before and after recovery, pagination/error shape, and dashboard
-asset serving:
-
+Run the test suite using `uv`:
 ```bash
 uv run pytest -q
 ```
-
-Tests run isolated against a scratch database (or `RELAY_DATABASE_URL` if set).
-The fixture drops and recreates all tables on whatever `RELAY_DATABASE_URL` points at.
+The test suite runs against an isolated scratch database, verifying idempotency, token hashing, sender/recipient isolation, claim token lifecycle, and concurrent race conditions.
