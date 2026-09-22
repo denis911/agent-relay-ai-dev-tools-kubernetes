@@ -88,6 +88,13 @@ Manifests are provided in `k8s/` including persistent storage (`postgres-pvc`), 
    ```
    Now access the API and Dashboard at `http://127.0.0.1:8000/`.
 
+5. **Teardown & Cleanup**:
+   To delete the KinD cluster and all associated resources when finished:
+   ```bash
+   kind delete cluster --name agent-relay
+   docker rmi agent-relay:local
+   ```
+
 ### Locally with uv
 ```bash
 uv sync
